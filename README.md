@@ -1,5 +1,7 @@
 # Robot Manipulador Mecatrónico de 4 GDL con Programación de Trayectorias
-(TRYNDA 3D/Ensamble 1 TRYNDA.png)
+
+<img width="1062" height="783" alt="Ensamble 1 TRYNDA" src="https://github.com/user-attachments/assets/38f893af-e7ad-41b7-9cb9-6912a2148100" />
+
 
 ## Descripción
 
@@ -271,3 +273,6 @@ Debido a las altas cargas transmitidas por una de las articulaciones, fue necesa
 Tecnología Superior en Mecatrónica
 
 TECAZUAY – Ecuador
+<img width="575" height="562" alt="TRYNDA real" src="https://github.com/user-attachments/assets/34f5c46e-22c9-4a82-93b3-126874cfc13c" />
+<img width="899" height="1599" alt="TRYNDA real 2" src="https://github.com/user-attachments/assets/ad195d50-d67a-4407-a31a-6321e3fb672c" />
+
