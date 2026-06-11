@@ -1,5 +1,5 @@
 # Robot Manipulador Mecatrónico de 4 GDL con Programación de Trayectorias
-(TRYNDA 3D/Ensamble1 TRYNDA.png)
+!(TRYNDA 3D/Ensamble1 TRYNDA.png)
 
 ## Descripción
 
