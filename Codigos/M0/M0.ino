@@ -1,0 +1,475 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <Adafruit_INA219.h> 
+#include <ESP32Servo.h>
+
+#define SDA_ENC 19  
+#define SCL_ENC 18
+#define AS5600_ADDR 0x36 
+
+#define SDA_NANO 21 
+#define SCL_NANO 22
+
+#define NANO_HOMBRO_ADDR 0x10 
+#define NANO_CODO_ADDR   0x11 
+#define NANO_MUNECA_ADDR 0x13 
+
+TwoWire WireNano = TwoWire(1); 
+Adafruit_INA219 ina219; 
+Servo gripperServo;
+
+#define VELOCIDAD_SERVO_AUTO   25    
+#define VELOCIDAD_SERVO_MANUAL 20    
+#define TIEMPO_ESPERA_PUNTOS   1500  
+
+
+//PINES BASE
+#define DIR0         12    
+#define STEP0        14    
+#define ENA0         27    
+#define FIN_CARRERA  17    
+#define PIN_PARO     26
+
+//PINES LEDS
+#define LED_ROJO     15   
+#define LED_VERDE    2    
+
+//PIN SERVO
+#define SERVO_PIN    32
+
+#define REDUCCION 19.21
+#define ANGULO_HOME 0.0    
+
+// Memoria 
+float puntosGuardados[20];
+int puntosServoGuardados[20];
+int totalPuntos = 0;
+bool reproduciendo = false;
+int indicePunto = 0;
+unsigned long tiempoEsperaPunto = 0;
+bool periodoDeGracia = false;
+unsigned long inicioGracia = 0;
+
+volatile bool emergenciaActiva = false; 
+
+float degAngle = 0, lastAngle = 0;
+long vueltas = 0; 
+float anguloMotor = 0, anguloSalida = 0, anguloFinal = 0, offset = 0, objetivo = 0;
+bool homingHecho = false, iniciarHoming = false, enMovimientoAngulo = false;
+float tolerancia = 0.3;
+int velMax = 500, velMin = 1200;
+
+String comando = "STOP";
+String ultimoCmd = "";
+unsigned long lastI2CSend = 0;
+const int intervaloI2C = 100; 
+long pasosM0 = 0; 
+
+bool hombroEnMovimiento = false;
+bool codoEnMovimiento = false;
+bool munecaEnMovimiento = false;
+unsigned long lastNanoCheck = 0;
+
+// VARIABLES SERVO
+int anguloServo = 0;         
+int objetivoServo = 0;       
+bool garraEnMovimiento = false;
+float umbralCorrienteMA = 2000.0;
+unsigned long lastServoTime = 0;
+
+typedef struct { char msg[24]; } Packet;
+Packet packet;
+
+void actualizarLeds() {
+  bool paroFisicoActivo = (digitalRead(PIN_PARO) == HIGH);
+  if (paroFisicoActivo || emergenciaActiva) {
+    digitalWrite(LED_ROJO, HIGH); digitalWrite(LED_VERDE, LOW);
+  } 
+  else if (!homingHecho) {
+    static unsigned long lastBlink = 0;
+    static bool estadoRojo = LOW;
+    digitalWrite(LED_VERDE, LOW);
+    if (millis() - lastBlink > 300) {
+      estadoRojo = !estadoRojo; digitalWrite(LED_ROJO, estadoRojo); lastBlink = millis();
+    }
+  } 
+  else {
+    digitalWrite(LED_ROJO, LOW);
+    if (!reproduciendo) { digitalWrite(LED_VERDE, HIGH); }
+  }
+}
+
+void enviarI2C(uint8_t addr, String msg) {
+  msg.toUpperCase();
+  WireNano.beginTransmission(addr); WireNano.write((const uint8_t*)msg.c_str(), msg.length()); WireNano.endTransmission();
+}
+
+void gestionarEnviosI2C() {
+  if (comando.startsWith("M2") || comando.startsWith("GOTO_M2")) { enviarI2C(NANO_HOMBRO_ADDR, comando); } 
+  else if (comando.startsWith("M3") || comando.startsWith("GOTO_M3")) { enviarI2C(NANO_CODO_ADDR, comando); } 
+  else if (comando.startsWith("M4") || comando.startsWith("GOTO_M4")) { enviarI2C(NANO_MUNECA_ADDR, comando); }
+  else if (comando == "SAVE" || comando == "DELETE") {
+    enviarI2C(NANO_HOMBRO_ADDR, comando); enviarI2C(NANO_CODO_ADDR, comando); enviarI2C(NANO_MUNECA_ADDR, comando);
+  } 
+  else if (comando == "STOP") {
+    enviarI2C(NANO_HOMBRO_ADDR, "M2_STOP"); enviarI2C(NANO_CODO_ADDR, "M3_STOP"); enviarI2C(NANO_MUNECA_ADDR, "M4_STOP");
+  }
+}
+
+void controlMovimientoPorAngulo() {
+  if (objetivo > 360.0) objetivo = 360.0;
+  if (objetivo < -15.0) objetivo = -15.0;
+  static int estable = 0;
+  float error = objetivo - anguloFinal;
+  if (abs(error) > tolerancia) {
+    estable = 0; digitalWrite(DIR0, (error > 0) ? HIGH : LOW); 
+    int velocidad = constrain(map(abs(error), 0, 30, velMin, velMax), velMax, velMin);
+    int pasos = constrain(map(abs(error), 0, 50, 2, 50), 1, 20);
+    for (int i = 0; i < pasos; i++) moverUnPaso(velocidad);
+  } else {
+    estable++; if (estable > 10) { enMovimientoAngulo = false; estable = 0; }
+  }
+}
+
+void hacerHoming() {
+  digitalWrite(ENA0, LOW); 
+  delay(1000);
+  if (digitalRead(FIN_CARRERA) == LOW) {
+ 
+    Serial.println("HOMING BASE zona de 60°");
+    digitalWrite(DIR0, LOW); 
+    while (digitalRead(FIN_CARRERA) == LOW && digitalRead(PIN_PARO) == LOW && !emergenciaActiva) { 
+      moverUnPaso(800); 
+    }
+    if (digitalRead(PIN_PARO) == HIGH || emergenciaActiva) { abortarTodoHoming(); return; }
+    delay(300);
+    
+    Serial.println("BASE Zona libre");
+    digitalWrite(DIR0, HIGH); 
+    while (digitalRead(FIN_CARRERA) == HIGH && digitalRead(PIN_PARO) == LOW && !emergenciaActiva) { 
+      moverUnPaso(1600);
+    }
+  } 
+  else {
+    Serial.println("BASE zona libre de 300°");
+    digitalWrite(DIR0, HIGH); 
+    while (digitalRead(FIN_CARRERA) == HIGH && digitalRead(PIN_PARO) == LOW && !emergenciaActiva) { 
+      moverUnPaso(800); 
+    }
+    if (digitalRead(PIN_PARO) == HIGH || emergenciaActiva) { abortarTodoHoming(); return; }
+    delay(200);
+
+    digitalWrite(DIR0, LOW); 
+    for (int i = 0; i < 350; i++) {
+      if (digitalRead(PIN_PARO) == HIGH || emergenciaActiva) { abortarTodoHoming(); return; }
+      moverUnPaso(800);
+    }
+    delay(200);
+    
+    digitalWrite(DIR0, HIGH); 
+    while (digitalRead(FIN_CARRERA) == HIGH && digitalRead(PIN_PARO) == LOW && !emergenciaActiva) { 
+      moverUnPaso(1600); 
+    }
+  }
+  
+  if (digitalRead(PIN_PARO) == HIGH || emergenciaActiva) { abortarTodoHoming(); return; }
+  
+  delay(5); actualizarPosicion(); offset = anguloSalida - ANGULO_HOME; 
+  homingHecho = true; pasosM0 = 0; objetivo = 0; comando = "STOP"; delay(500); 
+
+  enviarI2C(NANO_HOMBRO_ADDR, "M2_HOME"); delay(100); 
+  enviarI2C(NANO_CODO_ADDR, "M3_HOME"); delay(100);
+  enviarI2C(NANO_MUNECA_ADDR, "M4_HOME"); delay(100);
+  
+  Serial.println("test mecánico Gripper");
+  for (int ang = 0; ang <= 170; ang += 2) {
+    gripperServo.write(ang);
+    delay(15); 
+  }
+  delay(300);
+  for (int ang = 170; ang >= 0; ang -= 2) {
+    gripperServo.write(ang);
+    delay(15);
+  }
+  
+  anguloServo = 0;
+  gripperServo.write(anguloServo);
+  
+  Serial.println("SISTEMA EN HOME"); comando = "STOP"; 
+}
+
+void abortarTodoHoming() {
+  homingHecho = false;
+  enviarI2C(NANO_HOMBRO_ADDR, "STOP"); enviarI2C(NANO_CODO_ADDR, "STOP"); enviarI2C(NANO_MUNECA_ADDR, "STOP");
+  comando = "STOP"; Serial.println("⚠️ HOMING ABORTADO");
+}
+
+void dispararPunto() {
+  objetivo = puntosGuardados[indicePunto]; enMovimientoAngulo = true;
+  
+  objetivoServo = puntosServoGuardados[indicePunto]; 
+  garraEnMovimiento = true; 
+
+  hombroEnMovimiento = true; codoEnMovimiento = true; munecaEnMovimiento = true;
+  tiempoEsperaPunto = 0; comando = "ANGULO_AUTO";
+  
+  enviarI2C(NANO_HOMBRO_ADDR, "SYNC_" + String(indicePunto)); 
+  enviarI2C(NANO_CODO_ADDR, "SYNC_" + String(indicePunto)); 
+  enviarI2C(NANO_MUNECA_ADDR, "SYNC_" + String(indicePunto)); 
+  periodoDeGracia = true; inicioGracia = millis();
+}
+
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  memcpy(&packet, data, sizeof(packet));
+  String temp = String(packet.msg); temp.trim(); String tempUpper = temp; tempUpper.toUpperCase();
+
+  if (tempUpper == "EMERGENCIA_ON") { emergenciaActiva = true; comando = "STOP"; }
+  else if (tempUpper == "EMERGENCIA_OFF") { emergenciaActiva = false; }
+  else if (tempUpper == "FREE_ALL") {
+    comando = "STOP"; enMovimientoAngulo = false; reproduciendo = false; garraEnMovimiento = false;
+    digitalWrite(ENA0, HIGH); 
+    enviarI2C(NANO_HOMBRO_ADDR, "M2_FREE"); enviarI2C(NANO_CODO_ADDR, "M3_FREE"); enviarI2C(NANO_MUNECA_ADDR, "M4_FREE");
+  }
+  else if (tempUpper == "LOCK_ALL") {
+    comando = "STOP"; enMovimientoAngulo = false; reproduciendo = false;
+    digitalWrite(ENA0, LOW); objetivo = anguloFinal; 
+    enviarI2C(NANO_HOMBRO_ADDR, "M2_LOCK"); enviarI2C(NANO_CODO_ADDR, "M3_LOCK"); enviarI2C(NANO_MUNECA_ADDR, "M4_LOCK");
+  }
+  else if (tempUpper == "M1_HOME") { homingHecho = false; iniciarHoming = true; comando = "STOP"; }
+  else if (tempUpper == "M1_FREE") { digitalWrite(ENA0, HIGH); enMovimientoAngulo = false; reproduciendo = false; comando = "STOP"; }
+  else if (tempUpper == "M1_LOCK") { digitalWrite(ENA0, LOW); objetivo = anguloFinal; comando = "STOP"; }
+  
+  else if (tempUpper == "SAVE" || tempUpper == "DELETE" || tempUpper == "PLAY") {
+    comando = tempUpper; 
+    enviarI2C(NANO_HOMBRO_ADDR, tempUpper); enviarI2C(NANO_CODO_ADDR, tempUpper); enviarI2C(NANO_MUNECA_ADDR, tempUpper);
+    
+    if (tempUpper == "SAVE") { 
+      if(totalPuntos < 20) { 
+        puntosGuardados[totalPuntos] = anguloFinal; 
+        puntosServoGuardados[totalPuntos] = anguloServo;
+        
+        Serial.print("✅ PUNTO GUARDADO ["); Serial.print(totalPuntos + 1); Serial.println("/20]");
+        Serial.print("   -> Ángulo Base: "); Serial.print(anguloFinal);
+        Serial.print(" | Ángulo Servo Guardado: "); Serial.print(puntosServoGuardados[totalPuntos]); Serial.println("°");
+        
+        totalPuntos++; 
+        digitalWrite(LED_VERDE, LOW); delay(150); digitalWrite(LED_VERDE, HIGH);
+      } else { Serial.println("❌ MEMORIA LLENA."); }
+    }
+    else if (tempUpper == "DELETE") { 
+      if(totalPuntos > 0) { totalPuntos--; Serial.print("🗑️ RUTINA BORRADA. Quedan: "); Serial.println(totalPuntos); }
+      reproduciendo = false; enMovimientoAngulo = false; garraEnMovimiento = false;
+    }
+    else if (tempUpper == "PLAY") { 
+      if(totalPuntos > 0) { reproduciendo = true; indicePunto = 0; dispararPunto(); Serial.println("▶️ REPRODUCIENDO"); } 
+      else { Serial.println("⚠️ NO HAY PUNTOS."); }
+    }
+  }
+  else if (tempUpper == "M1_POSITIVE" || tempUpper == "M1_NEGATIVE" || tempUpper == "STOP" || tempUpper == "M1_STOP") {
+    enMovimientoAngulo = false; reproduciendo = false;
+    if (tempUpper == "M1_STOP" || tempUpper == "STOP") comando = "STOP"; else comando = tempUpper; 
+  }
+  else if (tempUpper == "M5_POSITIVE" || tempUpper == "M5_NEGATIVE" || tempUpper == "M5_STOP") {
+    if (!emergenciaActiva && digitalRead(PIN_PARO) == LOW) { comando = tempUpper; }
+  }
+  else if (tempUpper.startsWith("GOTO_M1:")) {
+    String valorStr = tempUpper.substring(8); objetivo = anguloFinal + valorStr.toFloat();       
+    objetivo = constrain(objetivo, -15.0, 360.0); enMovimientoAngulo = true; comando = "GOTO_M1"; 
+  }
+  else if (tempUpper.startsWith("M2") || tempUpper.startsWith("GOTO_M2") || tempUpper.startsWith("M3") || tempUpper.startsWith("GOTO_M3") || tempUpper.startsWith("M4") || tempUpper.startsWith("GOTO_M4")) {
+    comando = tempUpper;
+  }
+}
+
+bool sensorConectado() { Wire.beginTransmission(AS5600_ADDR); return (Wire.endTransmission() == 0); }
+
+void leerAngulo() {
+  Wire.beginTransmission(AS5600_ADDR); Wire.write(0x0C);
+  if (Wire.endTransmission() == 0) {
+    Wire.requestFrom(AS5600_ADDR, 2);
+    if (Wire.available() >= 2) { uint16_t raw = (Wire.read() << 8) | Wire.read(); degAngle = raw * 0.087890625; }
+  }
+}
+
+void actualizarPosicion() {
+  leerAngulo();
+  float delta = degAngle - lastAngle;
+  if (delta < -200) vueltas++; else if (delta > 200) vueltas--;
+  lastAngle = degAngle;
+  anguloMotor = (vueltas * 360.0) + degAngle; anguloSalida = -(anguloMotor / REDUCCION);
+  if (homingHecho) anguloFinal = anguloSalida - offset; else anguloFinal = anguloSalida;
+}
+
+void moverUnPaso(int velocidad) {
+  digitalWrite(STEP0, HIGH); delayMicroseconds(velocidad); digitalWrite(STEP0, LOW); delayMicroseconds(velocidad);
+  if (digitalRead(DIR0) == HIGH) pasosM0++; else pasosM0--;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_PARO, INPUT_PULLUP);
+  
+  pinMode(LED_ROJO, OUTPUT); pinMode(LED_VERDE, OUTPUT);
+  digitalWrite(LED_ROJO, HIGH); digitalWrite(LED_VERDE, LOW);
+  
+  pinMode(FIN_CARRERA, INPUT_PULLUP);
+  pinMode(DIR0, OUTPUT); pinMode(STEP0, OUTPUT); pinMode(ENA0, OUTPUT);
+  digitalWrite(ENA0, LOW);
+
+
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  gripperServo.setPeriodHertz(50); 
+  gripperServo.attach(SERVO_PIN, 500, 2400);
+  
+  anguloServo = 0;
+  gripperServo.write(anguloServo);
+
+  Wire.begin(SDA_ENC, SCL_ENC); Wire.setClock(400000);
+  if (!ina219.begin(&Wire)) Serial.println("⚠️ INA219");
+  else Serial.println("✅ INA219 OK");
+
+  WireNano.begin(SDA_NANO, SCL_NANO, 100000);
+  int intentos = 0; while (!sensorConectado() && intentos < 5) { delay(500); intentos++; }
+  WiFi.mode(WIFI_STA); esp_now_init(); esp_now_register_recv_cb(onDataRecv);
+  actualizarPosicion(); lastAngle = degAngle;
+  Serial.println("✅ SETUP OK"); 
+}
+
+void loop() {
+  actualizarLeds();
+
+  if (digitalRead(PIN_PARO) == HIGH || emergenciaActiva) {
+    enMovimientoAngulo = false; iniciarHoming = false; reproduciendo = false; comando = "STOP"; garraEnMovimiento = false;
+    digitalWrite(ENA0, LOW); objetivo = anguloFinal; 
+    enviarI2C(NANO_HOMBRO_ADDR, "STOP"); enviarI2C(NANO_CODO_ADDR, "STOP"); enviarI2C(NANO_MUNECA_ADDR, "STOP");
+    delay(50); return; 
+  }
+
+  if (!iniciarHoming) {
+    if (reproduciendo) {
+      if (millis() - lastServoTime > VELOCIDAD_SERVO_AUTO) {
+        long errorGarra = objetivoServo - anguloServo;
+        
+        if (abs(errorGarra) > 0) {
+          garraEnMovimiento = true;
+          
+          if (errorGarra > 0) {
+            if (ina219.getCurrent_mA() > umbralCorrienteMA) {
+              Serial.println("⚠️ Congelando garra");
+              objetivoServo = anguloServo;
+              garraEnMovimiento = false;
+            } else {
+              anguloServo += 1;
+            }
+          } else {
+            anguloServo -= 1;
+          }
+          gripperServo.write(anguloServo);
+        } else {
+          garraEnMovimiento = false;
+        }
+        lastServoTime = millis();
+      }
+    } 
+    else {
+      // MODO MANUAL
+      garraEnMovimiento = false;
+      
+      if (millis() - lastServoTime > VELOCIDAD_SERVO_MANUAL) { 
+        if (comando == "M5_POSITIVE") { 
+          float mA = ina219.getCurrent_mA();
+          if (mA > umbralCorrienteMA) {
+            comando = "M5_HOLD";
+            Serial.print("ESCUDO Servo en "); Serial.print(anguloServo);
+            Serial.print("° | Corriente: "); Serial.print(mA); Serial.println("mA");
+          } else {
+            if (anguloServo < 170) anguloServo += 2;
+            gripperServo.write(anguloServo);
+          }
+        } 
+        else if (comando == "M5_NEGATIVE") { 
+          if (anguloServo > 0) anguloServo -= 2;
+          gripperServo.write(anguloServo);
+        }
+        lastServoTime = millis();
+      }
+      
+      if (comando == "M5_STOP" || comando == "STOP") {
+      }
+      else if (comando == "M5_HOLD") {
+        gripperServo.write(anguloServo);
+      }
+    }
+  }
+
+  bool esComandoRemoto = comando.startsWith("M2") || comando.startsWith("GOTO_M2") || comando.startsWith("M3") || comando.startsWith("GOTO_M3") || comando.startsWith("M4") || comando.startsWith("GOTO_M4") || comando == "STOP";
+  if (reproduciendo) esComandoRemoto = false; 
+
+  if (comando != ultimoCmd || (esComandoRemoto && (millis() - lastI2CSend > intervaloI2C))) {
+    gestionarEnviosI2C(); ultimoCmd = comando; lastI2CSend = millis();
+  }
+
+  if (iniciarHoming && !homingHecho) { hacerHoming(); iniciarHoming = false; }
+  actualizarPosicion();
+  
+  if (reproduciendo) {
+    if (periodoDeGracia) { 
+      if (millis() - inicioGracia > 400) { periodoDeGracia = false; lastNanoCheck = millis(); } 
+    } 
+    else {
+      if (millis() - lastNanoCheck > 100) {
+        WireNano.requestFrom((uint16_t)NANO_HOMBRO_ADDR, (uint8_t)1); if (WireNano.available()) hombroEnMovimiento = (WireNano.read() == 1); else hombroEnMovimiento = false;
+        WireNano.requestFrom((uint16_t)NANO_CODO_ADDR, (uint8_t)1); if (WireNano.available()) codoEnMovimiento = (WireNano.read() == 1); else codoEnMovimiento = false;
+        WireNano.requestFrom((uint16_t)NANO_MUNECA_ADDR, (uint8_t)1); if (WireNano.available()) munecaEnMovimiento = (WireNano.read() == 1); else munecaEnMovimiento = false;
+        lastNanoCheck = millis();
+      }
+
+      if (!enMovimientoAngulo && !hombroEnMovimiento && !codoEnMovimiento && !munecaEnMovimiento && !garraEnMovimiento) {
+        if (tiempoEsperaPunto == 0) { tiempoEsperaPunto = millis(); } 
+        else if (millis() - tiempoEsperaPunto > TIEMPO_ESPERA_PUNTOS) { 
+          indicePunto++;
+          if (indicePunto < totalPuntos) { dispararPunto(); } 
+          else {
+            reproduciendo = false; comando = "STOP";
+            enviarI2C(NANO_HOMBRO_ADDR, "STOP"); enviarI2C(NANO_CODO_ADDR, "STOP"); enviarI2C(NANO_MUNECA_ADDR, "STOP");
+            Serial.println("✅ RUTINA OK");
+          }
+        }
+      } else {
+        tiempoEsperaPunto = 0;
+      }
+    }
+  }
+
+  if (enMovimientoAngulo) { 
+    controlMovimientoPorAngulo(); 
+  }
+  else if (!reproduciendo) {
+    if (comando == "M1_POSITIVE" && anguloFinal < 360.0) { 
+      digitalWrite(DIR0, HIGH); 
+      moverUnPaso(1000); 
+    }
+    else if (comando == "M1_NEGATIVE" && anguloFinal > -15.0) { 
+      digitalWrite(DIR0, LOW); 
+      moverUnPaso(1000); 
+    }
+  }
+
+  //MONITOREO
+  static unsigned long lastGlobalPrint = 0;
+  if (millis() - lastGlobalPrint > 250) {
+    Serial.print("📐 Base: "); Serial.print(anguloFinal);
+    //Serial.print("° | 🤖 Servo Gripper: "); Serial.print(anguloServo);
+    //Serial.print("° | ⚡ Corriente: "); Serial.print(ina219.getCurrent_mA()); Serial.print("mA");
+    if(reproduciendo) {
+    //Serial.print(" | 🎯 Obj Servo: "); Serial.print(objetivoServo);
+    //Serial.print(" | Estado: "); Serial.print(garraEnMovimiento ? "MOVIENDO" : "LLEGÓ");
+    }
+    Serial.println();
+    lastGlobalPrint = millis();
+  }
+}

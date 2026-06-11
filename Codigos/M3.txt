@@ -1,0 +1,271 @@
+#include <Wire.h>
+#include <SoftwareWire.h>
+
+#define I2C_ADDR 0x13     
+#define SDA_PIN 8
+#define SCL_PIN 7
+#define AS5600_ADDR 0x36
+SoftwareWire sensorWire(SDA_PIN, SCL_PIN);
+
+#define DIR_PIN   4
+#define STEP_PIN  5
+#define ENA_PIN   3  
+#define FIN_CARRERA 2
+
+#define PIN_PARO  6
+
+#define REDUCCION 5.0
+
+#define LIMITE_MIN -34.0
+#define LIMITE_MAX 226.0
+#define HOME_REAL 228.5
+
+float tolerancia = 0.2; 
+int velMax = 1200;   
+
+float puntosGuardados[20];
+int totalPuntos = 0;
+
+float degAngle = 0, lastAngle = 0;
+long vueltas = 0;
+float anguloMotor = 0, anguloSalida = 0, anguloFinal = 0, offset = 0;
+float objetivo = 90.0; 
+bool homingHecho = false, iniciarHoming = false, enMovimiento = false;
+
+char bufferI2C[32];
+volatile byte indiceBuffer = 0;
+volatile bool datoNuevoI2C = false;
+String comandoI2C = "STOP";
+String ultimoComandoI2C = "STOP"; 
+
+void receiveEvent(int bytes) {
+  while (Wire.available()) {
+    char c = Wire.read();
+    if (indiceBuffer < 30 && c >= 32 && c <= 126) { bufferI2C[indiceBuffer++] = toupper(c); }
+  }
+  bufferI2C[indiceBuffer] = '\0'; 
+  indiceBuffer = 0;
+  datoNuevoI2C = true;
+}
+
+void requestEvent() { Wire.write(enMovimiento ? 1 : 0); }
+
+bool sensorConectado() { 
+  sensorWire.beginTransmission(AS5600_ADDR); 
+  return (sensorWire.endTransmission() == 0); 
+}
+
+void leerAngulo() {
+  int reintentos = 0;
+  bool exito = false;
+  
+  while(!exito && reintentos < 4) {
+    sensorWire.beginTransmission(AS5600_ADDR); 
+    sensorWire.write(0x0C);
+    if (sensorWire.endTransmission() == 0) {
+      sensorWire.requestFrom(AS5600_ADDR, 2);
+      if (sensorWire.available() >= 2) { 
+        uint16_t raw = (sensorWire.read() << 8) | sensorWire.read(); 
+        if (raw <= 4095) { degAngle = raw * 0.087890625; exito = true; }
+      }
+    }
+    if(!exito) { reintentos++; sensorWire.begin(); delayMicroseconds(200); }
+  }
+  
+  if (!exito && enMovimiento) { 
+    enMovimiento = false; 
+    comandoI2C = "STOP"; 
+    Serial.println("⚠️ ERROR AS5600");
+  }
+}
+
+void actualizarPosicion() {
+  leerAngulo();
+  float delta = degAngle - lastAngle;
+  if (delta < -200) vueltas++; else if (delta > 200) vueltas--;
+  lastAngle = degAngle;
+  
+  anguloMotor = (vueltas * 360.0) + degAngle;
+  anguloSalida = -(anguloMotor / REDUCCION); 
+  
+  if (homingHecho) anguloFinal = anguloSalida - offset; else anguloFinal = anguloSalida;
+}
+
+void pasoMotor(int vel) {
+  digitalWrite(STEP_PIN, HIGH); delayMicroseconds(2); digitalWrite(STEP_PIN, LOW); delayMicroseconds(vel);
+}
+
+void hacerHoming() {
+  Serial.println("HOMING MUÑECA 🔄");
+  digitalWrite(ENA_PIN, LOW);
+  delay(1500);
+  
+  digitalWrite(DIR_PIN, LOW); 
+  while (digitalRead(FIN_CARRERA) == HIGH && digitalRead(PIN_PARO) == LOW) pasoMotor(800); 
+  if (digitalRead(PIN_PARO) == HIGH) return; // Aborta
+  delay(300);
+  
+  digitalWrite(DIR_PIN, HIGH); 
+  for (int i = 0; i < 400; i++) {
+    if (digitalRead(PIN_PARO) == HIGH) return; // Aborta
+    pasoMotor(1000); 
+  }
+  delay(500);
+  
+  digitalWrite(DIR_PIN, LOW); 
+  while (digitalRead(FIN_CARRERA) == HIGH && digitalRead(PIN_PARO) == LOW) pasoMotor(2500); 
+  if (digitalRead(PIN_PARO) == HIGH) return; // Aborta
+  delay(500); 
+  
+  actualizarPosicion();
+  offset = anguloSalida - HOME_REAL; 
+  homingHecho = true; 
+  
+  datoNuevoI2C = false; indiceBuffer = 0;
+  comandoI2C = "M4_STOP"; ultimoComandoI2C = "M4_STOP"; 
+
+  objetivo = 45.0; 
+  enMovimiento = true;   
+  Serial.println("HOME 🎯 Viajando a 90 grados");
+}
+
+void controlMovement() {
+  static int estable = 0;
+  static int ultimaDir = -1; 
+  
+  if (objetivo > LIMITE_MAX) objetivo = LIMITE_MAX;
+  if (objetivo < LIMITE_MIN) objetivo = LIMITE_MIN;
+  
+  float error = objetivo - anguloFinal;
+  float errorAbs = (error < 0) ? -error : error;
+
+  if (errorAbs > tolerancia) {
+    estable = 0; 
+
+    int nuevaDir = (error > 0) ? LOW : HIGH; 
+    
+    if (nuevaDir != ultimaDir && ultimaDir != -1) { delay(30); }
+    ultimaDir = nuevaDir;
+    digitalWrite(DIR_PIN, nuevaDir);
+    
+    int vel; int pasos;
+
+    if (errorAbs > 30.0) { 
+      vel = velMax;   
+      pasos = 80;     
+    } 
+    else if (errorAbs > 10.0) { 
+      vel = 1000;     
+      pasos = 20;     
+    } 
+    else if (errorAbs > 3.0) { 
+      vel = 1400;     
+      pasos = 5;      
+    } 
+    else { 
+      vel = 2000;     
+      pasos = 1;   
+    } 
+
+    for (int i = 0; i < pasos; i++) { pasoMotor(vel); }
+    
+  } else {
+    estable++; 
+    if (estable > 3) { 
+      enMovimiento = false; estable = 0; ultimaDir = -1; 
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200); sensorWire.begin();
+  Wire.begin(I2C_ADDR); Wire.onReceive(receiveEvent); Wire.onRequest(requestEvent); 
+  
+  pinMode(PIN_PARO, INPUT);
+
+  pinMode(DIR_PIN, OUTPUT); pinMode(STEP_PIN, OUTPUT); pinMode(ENA_PIN, OUTPUT); pinMode(FIN_CARRERA, INPUT_PULLUP);
+  digitalWrite(ENA_PIN, LOW);
+  int intentos = 0; while (!sensorConectado() && intentos < 5) { delay(500); intentos++; }
+  actualizarPosicion(); lastAngle = degAngle; objetivo = anguloFinal; 
+  comandoI2C = "STOP"; ultimoComandoI2C = "STOP"; iniciarHoming = false; homingHecho = false; enMovimiento = false;
+}
+
+void loop() {
+  if (digitalRead(PIN_PARO) == HIGH) {
+    enMovimiento = false;
+    iniciarHoming = false;
+    comandoI2C = "STOP";
+    
+    digitalWrite(ENA_PIN, LOW);  
+    objetivo = anguloFinal;
+    actualizarPosicion();        
+    datoNuevoI2C = false;        
+    return;
+  }
+
+  if (datoNuevoI2C) {
+
+    noInterrupts();
+    String cmdTemporal = String(bufferI2C);
+    datoNuevoI2C = false;
+    interrupts();
+    
+    cmdTemporal.trim();
+    if (cmdTemporal.length() < 3) return;
+    
+    comandoI2C = cmdTemporal;
+    
+    if (comandoI2C == "M4_HOME") {
+        homingHecho = false;  
+        iniciarHoming = true; 
+    } 
+    else if (comandoI2C != ultimoComandoI2C) {
+      bool comandoValido = true;
+      
+      if (comandoI2C == "M4_FREE") { digitalWrite(ENA_PIN, HIGH); enMovimiento = false; }
+      else if (comandoI2C == "M4_LOCK") { digitalWrite(ENA_PIN, LOW); objetivo = anguloFinal; enMovimiento = false; }
+      else if (comandoI2C == "SAVE") { if(totalPuntos < 20) { puntosGuardados[totalPuntos] = anguloFinal; totalPuntos++; } }
+      else if (comandoI2C == "DELETE") { if(totalPuntos > 0) totalPuntos--; enMovimiento = false; }
+      else if (comandoI2C == "STOP" || comandoI2C == "M4_STOP") { objetivo = anguloFinal; enMovimiento = false; } 
+      else if (comandoI2C.startsWith("GOTO_M4:")) {
+        if (homingHecho) { float incremento = comandoI2C.substring(8).toFloat(); objetivo = anguloFinal + incremento; enMovimiento = true; } 
+      }
+      else if (comandoI2C.startsWith("SYNC_")) {
+        int idx = comandoI2C.substring(5).toInt();
+        if (idx < totalPuntos) { objetivo = puntosGuardados[idx]; enMovimiento = true; }
+      }
+      else if (comandoI2C == "M4_POSITIVE" || comandoI2C == "M4_NEGATIVE") {
+      }
+      else {
+        comandoValido = false;
+      }
+      
+      if (comandoValido) {
+        ultimoComandoI2C = comandoI2C; 
+      }
+    }
+  }
+
+  if (!iniciarHoming && homingHecho) { 
+    if (comandoI2C == "M4_POSITIVE" && anguloFinal < LIMITE_MAX) { 
+      digitalWrite(DIR_PIN, LOW); for(int p = 0; p < 15; p++) pasoMotor(600); 
+      actualizarPosicion(); objetivo = anguloFinal; enMovimiento = false; 
+    } 
+    else if (comandoI2C == "M4_NEGATIVE" && anguloFinal > LIMITE_MIN) { 
+      digitalWrite(DIR_PIN, HIGH); for(int p = 0; p < 15; p++) pasoMotor(600); 
+      actualizarPosicion(); objetivo = anguloFinal; enMovimiento = false; 
+    }
+  }
+
+  if (iniciarHoming && !homingHecho) { hacerHoming(); iniciarHoming = false; }
+  
+  actualizarPosicion(); 
+  if (enMovimiento) { controlMovement(); }
+  
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 200) {
+    Serial.print("Ang: "); Serial.print(anguloFinal); Serial.print(" | Obj: "); Serial.print(objetivo);
+    Serial.print(" | Home: "); Serial.println(homingHecho ? "OK" : "NO");
+    lastPrint = millis();
+  }
+}
