@@ -271,8 +271,10 @@ Debido a las altas cargas transmitidas por una de las articulaciones, fue necesa
 * Edwin J. Suqui
 
 Tecnología Superior en Mecatrónica
-
 TECAZUAY – Ecuador
+
+
 <img width="575" height="562" alt="TRYNDA real" src="https://github.com/user-attachments/assets/34f5c46e-22c9-4a82-93b3-126874cfc13c" />
+
 <img width="899" height="1599" alt="TRYNDA real 2" src="https://github.com/user-attachments/assets/ad195d50-d67a-4407-a31a-6321e3fb672c" />
 
